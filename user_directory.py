@@ -1,0 +1,1 @@
+# user_directory.py is now empty. All user directory and user list logic has been removed in favor of using only server address for federation. 
