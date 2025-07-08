@@ -3,7 +3,9 @@ import configparser
 import random
 import threading
 from server import ServerBackend, run_server
-from client import ChatClientGUI
+from client import PyQtFederatedClient
+from PyQt6.QtWidgets import QApplication
+import sys
 
 def generate_gemstone_username():
     gemstones = [
@@ -36,12 +38,18 @@ san_list = [f"IP:{local_ip}"]
 if public_ip:
     san_list.append(f"IP:{public_ip}")
 
-if __name__ == "__main__":
+def main():
+    from server import ServerBackend, run_server
     CLIENT_ID = load_or_generate_username()
     # Start the server in a background thread, passing CLIENT_ID
     server_thread = threading.Thread(target=run_server, args=(CLIENT_ID,), daemon=True)
     server_thread.start()
-    # Start the client GUI, passing CLIENT_ID to the backend
-    server_backend = ServerBackend(CLIENT_ID)
-    gui = ChatClientGUI(server_backend, CLIENT_ID)
-    gui.root.mainloop()
+    # Start the backend and GUI
+    backend = ServerBackend(client_id=CLIENT_ID, host=local_ip, port=int(config['Network']['port']))
+    app = QApplication(sys.argv)
+    client = PyQtFederatedClient(backend, client_id=CLIENT_ID)
+    client.show()
+    sys.exit(app.exec())
+
+if __name__ == '__main__':
+    main()

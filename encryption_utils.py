@@ -49,7 +49,10 @@ def serialize_public_key(public_key):
     ).decode('utf-8')
 
 def deserialize_public_key(pem_str):
-    return serialization.load_pem_public_key(pem_str.encode('utf-8'), backend=default_backend())
+    return serialization.load_pem_public_key(
+        pem_str.encode('utf-8') if isinstance(pem_str, str) else pem_str,
+        backend=default_backend()
+    )
 
 def serialize_private_key(private_key):
     """Serialize a private key to PEM bytes."""
@@ -57,6 +60,13 @@ def serialize_private_key(private_key):
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption()
+    )
+
+def deserialize_private_key(pem_str):
+    return serialization.load_pem_private_key(
+        pem_str.encode('utf-8') if isinstance(pem_str, str) else pem_str,
+        password=None,
+        backend=default_backend()
     )
 
 # --- RSA Encryption/Decryption ---
