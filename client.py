@@ -3,39 +3,153 @@ import os
 import json
 import threading
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QListWidget, QTextEdit, QLineEdit, QPushButton, QVBoxLayout, QHBoxLayout, QListWidgetItem, QMessageBox, QInputDialog, QMenu
+    QApplication, QWidget, QListWidget, QTextEdit, QLineEdit, QPushButton, QVBoxLayout, QHBoxLayout, QListWidgetItem, QMessageBox, QInputDialog, QMenu, QFileDialog, QTextBrowser
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QRect, QCoreApplication
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.backends import default_backend
+from cryptography.fernet import Fernet, InvalidToken
+import base64
+import getpass
+import os
+import secrets
 
 class PyQtFederatedClient(QWidget):
     def __init__(self, backend, client_id=None):
         super().__init__()
         self.backend = backend
-        self.client_id = client_id or "Unknown"
+        self.client_id = client_id or backend.client_id
         self.setWindowTitle(f"Federated Chat Client (PyQt6) - {self.client_id}")
         self.resize(700, 500)
-        self.contacts = {}  # address -> username
-        self.active_chats = {}  # address -> [(sender, message)]
+        self.contacts = {}
+        self.removed_contacts = set()  # Track manually removed contacts
+        self.active_chats = {}
         self.current_server = None
-        self.contacts_file = "server_contacts.json"
-        self.automated_message_sent = set()  # Track which contacts have received the auto message
-        self.pending_contact_key_approval = set()  # addresses for which a contact request is pending key approval
+        self.unread_counts = {}
+        self.pending_contact_key_approval = set()
+        self.automated_message_sent = set()
+        self.contacts_file = f'contacts_{self.client_id}.json'
+        self.salt_file = "chat_salt.bin"
+        self.salt = self.load_or_create_salt()
+        # Center the window before showing password prompt
+        self.center_on_screen()
+        self.key = self.prompt_for_password_and_derive_key()
         self.load_contacts()
+        self.load_all_chat_histories()
+        self.clear_old_html_messages() # Call the new method here
         self.init_ui()
         self.poll_timer = QTimer()
         self.poll_timer.timeout.connect(self.poll_backend)
         self.poll_timer.start(100)
+        # Center the main window after UI setup
+        self.center_on_screen()
+
+    def load_or_create_salt(self):
+        if os.path.exists(self.salt_file):
+            with open(self.salt_file, 'rb') as f:
+                return f.read()
+        salt = secrets.token_bytes(16)
+        with open(self.salt_file, 'wb') as f:
+            f.write(salt)
+        return salt
+
+    def prompt_for_password_and_derive_key(self):
+        while True:
+            # Center the dialog
+            self.center_on_screen()
+            password, ok = QInputDialog.getText(self, "Password", "Enter password to unlock chat history:", QLineEdit.EchoMode.Password)
+            if not ok or not password:
+                QMessageBox.critical(self, "Error", "Password required to unlock chat history.")
+                sys.exit(1)
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=self.salt,
+                iterations=390000,
+                backend=default_backend()
+            )
+            key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+            # Try to decrypt a known file (if exists) to verify password
+            try:
+                if os.path.exists("chat_test.enc"):
+                    with open("chat_test.enc", "rb") as f:
+                        Fernet(key).decrypt(f.read())
+                else:
+                    # Save a test file for future verification
+                    with open("chat_test.enc", "wb") as f:
+                        f.write(Fernet(key).encrypt(b"test"))
+                return key
+            except InvalidToken:
+                QMessageBox.critical(self, "Error", "Incorrect password. Please try again.")
+
+    def get_chat_history_file(self, address):
+        return f"chat_{address.replace(':', '_')}.enc"
+
+    def save_chat_history(self, address):
+        file = self.get_chat_history_file(address)
+        messages = self.active_chats.get(address, [])
+        try:
+            data = json.dumps(messages).encode()
+            encrypted = Fernet(self.key).encrypt(data)
+            with open(file, "wb") as f:
+                f.write(encrypted)
+        except Exception as e:
+            print(f"[CLIENT-DEBUG] Failed to save chat history for {address}: {e}")
+
+    def load_chat_history(self, address):
+        file = self.get_chat_history_file(address)
+        if not os.path.exists(file):
+            return []
+        try:
+            with open(file, "rb") as f:
+                encrypted = f.read()
+            data = Fernet(self.key).decrypt(encrypted)
+            return json.loads(data.decode())
+        except Exception as e:
+            print(f"[CLIENT-DEBUG] Failed to load chat history for {address}: {e}")
+            return []
+
+    def clear_old_html_messages(self):
+        """Clear old chat history that contains HTML Accept/Decline messages"""
+        for address in list(self.active_chats.keys()):
+            messages = self.active_chats[address]
+            # Filter out messages that contain HTML Accept/Decline links
+            filtered_messages = []
+            for msg in messages:
+                if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == 'System':
+                    message = msg[1]
+                    if isinstance(message, str) and ('accept://' in message or 'decline://' in message):
+                        # Skip old HTML Accept/Decline messages
+                        continue
+                filtered_messages.append(msg)
+            
+            if len(filtered_messages) != len(messages):
+                print(f"[CLIENT-DEBUG] Cleared {len(messages) - len(filtered_messages)} old HTML messages from {address}")
+                self.active_chats[address] = filtered_messages
+                self.save_chat_history(address)
+
+    def load_all_chat_histories(self):
+        self.active_chats = {}
+        for address in self.contacts:
+            self.active_chats[address] = self.load_chat_history(address)
 
     def init_ui(self):
         main_layout = QHBoxLayout(self)
+        # Menu bar
+        self.menu_bar = QMenu(self)
+        self.menu = QMenu("Menu", self)
+        self.menu_bar.addAction(self.menu.menuAction())
+        self.menu.addAction("Add Contact", self.on_add_contact)
+        self.menu.addAction("Lock", self.lock_ui)
+        self.menuBarWidget = QPushButton("☰ Menu")
+        self.menuBarWidget.setMenu(self.menu)
+        main_layout.addWidget(self.menuBarWidget, alignment=Qt.AlignmentFlag.AlignTop)
         # Left panel (vertical layout)
         left_panel = QVBoxLayout()
         self.username_label = QPushButton(f"Username: {self.client_id}")
         self.username_label.setEnabled(False)
         left_panel.addWidget(self.username_label)
-        self.connect_button = QPushButton("Add Contact")
-        self.connect_button.clicked.connect(self.on_add_contact)
-        left_panel.addWidget(self.connect_button)
         # Contact list
         self.contact_list = QListWidget()
         self.contact_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -46,8 +160,11 @@ class PyQtFederatedClient(QWidget):
         main_layout.addLayout(left_panel, 2)
         # Chat area
         chat_layout = QVBoxLayout()
-        self.chat_display = QTextEdit()
+        self.chat_display = QTextBrowser()
         self.chat_display.setReadOnly(True)
+        # Enable clickable links and buttons
+        self.chat_display.setOpenExternalLinks(False)
+        self.chat_display.anchorClicked.connect(self.handle_chat_link)
         chat_layout.addWidget(self.chat_display, 8)
         # Message entry
         entry_layout = QHBoxLayout()
@@ -57,6 +174,11 @@ class PyQtFederatedClient(QWidget):
         self.send_button = QPushButton("Send")
         self.send_button.clicked.connect(self.on_send_message)
         entry_layout.addWidget(self.send_button, 2)
+        # File attachment button
+        self.attach_button = QPushButton("📎")
+        self.attach_button.setToolTip("Attach file")
+        self.attach_button.clicked.connect(self.on_attach_file)
+        entry_layout.addWidget(self.attach_button, 1)
         chat_layout.addLayout(entry_layout)
         main_layout.addLayout(chat_layout, 8)
         self.setLayout(main_layout)
@@ -68,15 +190,18 @@ class PyQtFederatedClient(QWidget):
                 with open(self.contacts_file, 'r') as f:
                     data = json.load(f)
                     self.contacts = data.get('contacts', {})
+                    self.removed_contacts = set(data.get('removed_contacts', [])) # Load removed contacts
             except Exception:
                 self.contacts = {}
+                self.removed_contacts = set()
         else:
             self.contacts = {}
+            self.removed_contacts = set()
 
     def save_contacts(self):
         try:
             with open(self.contacts_file, 'w') as f:
-                json.dump({'contacts': self.contacts}, f)
+                json.dump({'contacts': self.contacts, 'removed_contacts': list(self.removed_contacts)}, f)
         except Exception:
             pass
 
@@ -88,21 +213,44 @@ class PyQtFederatedClient(QWidget):
         self.update_contact_list()
 
     def update_contact_list(self):
+        # Preserve current selection
+        prev_address = self.current_server
+        self.contact_list.blockSignals(True)
         self.contact_list.clear()
+        addresses = sorted(self.contacts.keys(), key=lambda x: self.contacts[x])
         for address, username in sorted(self.contacts.items(), key=lambda x: x[1]):
-            item = QListWidgetItem(f"{username} ({address})")
+            unread = self.unread_counts.get(address, 0)
+            if username == address:
+                display = f"{address}"
+            else:
+                display = f"{username} ({address})"
+            if unread > 0:
+                item = QListWidgetItem(f"{display} [{unread}]")
+            else:
+                item = QListWidgetItem(f"{display}")
             self.contact_list.addItem(item)
+        # Restore previous selection if possible
+        if prev_address in addresses:
+            idx = addresses.index(prev_address)
+            self.contact_list.setCurrentRow(idx)
+        self.contact_list.blockSignals(False)
 
     def refresh_contacts_from_backend(self):
+        prev_address = self.current_server
         try:
             contacts = self.backend.get_contacts()
-            # If backend returns only addresses, keep old usernames if possible
             for addr in contacts:
-                if addr not in self.contacts:
+                # Don't reload contacts that have been manually removed
+                if addr not in self.removed_contacts and addr not in self.contacts:
                     self.contacts[addr] = addr
             self.update_contact_list()
         except Exception as e:
             print(f"[CLIENT-DEBUG] refresh_contacts_from_backend error: {e}")
+        # Restore previous selection if possible
+        addresses = sorted(self.contacts.keys(), key=lambda x: self.contacts[x])
+        if prev_address in addresses:
+            idx = addresses.index(prev_address)
+            self.contact_list.setCurrentRow(idx)
 
     def poll_backend(self):
         try:
@@ -111,17 +259,21 @@ class PyQtFederatedClient(QWidget):
                 return
             print(f"[CLIENT-DEBUG] poll_backend received: {msg}")
             msg_type = msg.get('type')
+            print(f"[CLIENT-DEBUG] Message type: {msg_type}")
             if msg_type == 'chat_message':
                 address = msg.get('from_server') or msg.get('address')
                 from_client = msg.get('from_client', address)
                 message = msg.get('message')
                 if address not in self.active_chats:
-                    self.active_chats[address] = []
+                    self.active_chats[address] = self.load_chat_history(address)
                 self.active_chats[address].append((from_client, message))
-                self.display_chat(address)
-                if self.current_server != address:
-                    self.current_server = address
+                self.save_chat_history(address)
+                # Only update chat display if the message is for the currently selected contact
+                if self.current_server == address:
                     self.display_chat(address)
+                else:
+                    self.unread_counts[address] = self.unread_counts.get(address, 0) + 1
+                    self.update_contact_list()
                 if address not in self.contacts and message.endswith('has accepted your chat request.'):
                     public_key = None
                     if hasattr(self.backend, 'get_public_key'):
@@ -144,8 +296,7 @@ class PyQtFederatedClient(QWidget):
                 is_new = address not in self.contacts
                 self.update_contact(address, username)
                 self.refresh_contacts_from_backend()
-                # Only send automated message if this is a new contact and we haven't sent it before
-                if is_new and username != self.client_id and address not in self.automated_message_sent:
+                if is_new and username != self.client_id and address not in self.automated_message_sent and address not in self.removed_contacts:
                     auto_msg = f"{self.client_id} has accepted your chat request."
                     print(f"[CLIENT-DEBUG] Sending automated acceptance message to {address}: {auto_msg}")
                     self.backend.send_command('chat_message', f'{address} {auto_msg}')
@@ -153,7 +304,80 @@ class PyQtFederatedClient(QWidget):
             elif msg_type == 'info':
                 print(f"[CLIENT-DEBUG] info event: {msg.get('message')}")
                 self.refresh_contacts_from_backend()
-                QMessageBox.information(self, "Info", msg.get('message', ''))
+            elif msg_type == 'file_metadata':
+                address = msg.get('from_server') or msg.get('from_client') or msg.get('address')
+                file_id = msg.get('file_id')
+                meta = msg.get('metadata', {})
+                print(f"[CLIENT-DEBUG] Received file_metadata for file_id: {file_id}")
+                # Progress dialog is already shown when accepting the file offer
+                # No need to add chat messages anymore
+            elif msg_type == 'file_complete':
+                address = msg.get('from_server') or msg.get('from_client') or msg.get('address')
+                file_id = msg.get('file_id')
+                decrypted_path = msg.get('decrypted_path')
+                orig_filename = msg.get('orig_filename')
+                print(f"[CLIENT-DEBUG] file_complete: address={address}, file_id={file_id}, dec_path={decrypted_path}")
+                
+                # Close progress dialog and show completion popup
+                self.close_file_progress_dialog(file_id)
+                
+                # No need to add chat messages anymore since we show popup
+            elif msg_type == 'file_offer':
+                address = msg.get('from_server') or msg.get('from_client') or msg.get('address')
+                file_id = msg.get('file_id')
+                filename = msg.get('filename')
+                from_client = msg.get('from_client', address)
+                size = msg.get('size', 0)
+                
+                # Show file offer popup with Accept/Decline buttons
+                size_mb = size / (1024 * 1024) if size > 0 else 0
+                text = f"{from_client} wants to send:\n\nFile: {filename}\nSize: {size_mb:.1f} MB\n\nAccept this file transfer?"
+                
+                reply = QMessageBox.question(
+                    self, 
+                    "File Transfer Request", 
+                    text, 
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No
+                )
+                
+                if reply == QMessageBox.StandardButton.Yes:
+                    # Accept the file transfer
+                    print(f"[CLIENT-DEBUG] Accepting file transfer: {file_id}")
+                    self.backend.send_command('file_offer_response', f'{address} {file_id} accept')
+                    
+                    # Show progress dialog for download (non-modal)
+                    self.show_file_progress_dialog(address, file_id, filename, size)
+                else:
+                    # Decline the file transfer
+                    print(f"[CLIENT-DEBUG] Declining file transfer: {file_id}")
+                    self.backend.send_command('file_offer_response', f'{address} {file_id} decline')
+                    
+                    # Show decline confirmation
+                    QMessageBox.information(self, "File Transfer Declined", f"File transfer for {filename} was declined.")
+            elif msg_type == 'file_chunk':
+                file_id = msg.get('file_id')
+                chunk_num = msg.get('chunk_num')
+                total_chunks = msg.get('total_chunks')
+                print(f"[CLIENT-DEBUG] Received file_chunk {chunk_num}/{total_chunks} for file_id: {file_id}")
+                
+                # Update progress dialog with actual progress
+                if hasattr(self, 'file_progress_dialogs'):
+                    print(f"[CLIENT-DEBUG] Progress dialogs: {list(self.file_progress_dialogs.keys())}")
+                    if file_id in self.file_progress_dialogs:
+                        progress = self.file_progress_dialogs[file_id]
+                        if total_chunks > 0:
+                            progress_value = int((chunk_num / total_chunks) * 100)
+                            progress.setValue(progress_value)
+                            print(f"[CLIENT-DEBUG] Updated progress to {progress_value}% for file {file_id}")
+                        else:
+                            print(f"[CLIENT-DEBUG] total_chunks is 0 or invalid: {total_chunks}")
+                    else:
+                        print(f"[CLIENT-DEBUG] No progress dialog found for file_id: {file_id}")
+                else:
+                    print(f"[CLIENT-DEBUG] No file_progress_dialogs attribute found")
+                
+                # Progress is handled by the progress dialog, no need for chat messages
             else:
                 print(f"[CLIENT-DEBUG] Unhandled message type: {msg_type}")
         except Exception as e:
@@ -192,24 +416,41 @@ class PyQtFederatedClient(QWidget):
         idx = self.contact_list.currentRow()
         address = list(sorted(self.contacts.keys(), key=lambda x: self.contacts[x]))[idx]
         self.current_server = address
+        self.unread_counts[address] = 0
+        self.update_contact_list()
+        if address not in self.active_chats:
+            self.active_chats[address] = self.load_chat_history(address)
         self.display_chat(address)
 
     def display_chat(self, address):
         self.chat_display.clear()
         messages = self.active_chats.get(address, [])
-        for sender, message in messages:
-            # Map sender to username if possible
-            if sender == self.client_id:
-                display_name = "You"
-            elif sender in self.contacts.values():
-                # sender is a username
-                display_name = sender
-            elif sender in self.contacts:
-                # sender is an address
-                display_name = self.contacts.get(sender, sender)
+        for msg in messages:
+            if isinstance(msg, tuple) and len(msg) > 2 and isinstance(msg[2], dict) and msg[2].get('status') == 'ready':
+                # File ready to open
+                file_info = msg[2]
+                orig_filename = file_info.get('meta', {}).get('orig_filename', file_info.get('file_id'))
+                path = file_info.get('path')
+                self.chat_display.append(f'<a href="file://{path}"><b>{msg[0]}:</b> [File: {orig_filename}] (Click to open)</a>')
             else:
-                display_name = sender
-            self.chat_display.append(f"<b>{display_name}:</b> {message}")
+                sender, message = msg[:2]
+                if sender == 'System':
+                    if isinstance(message, str):
+                        print(f"[CLIENT-DEBUG] Appending System message to chat: {message}")
+                        self.chat_display.append(message)
+                    else:
+                        # Skip or stringify non-string system messages to avoid crash
+                        self.chat_display.append(str(message))
+                else:
+                    if sender == self.client_id:
+                        display_name = "You"
+                    elif sender in self.contacts.values():
+                        display_name = sender
+                    elif sender in self.contacts:
+                        display_name = self.contacts.get(sender, sender)
+                    else:
+                        display_name = sender
+                    self.chat_display.append(f"<b>{display_name}:</b> {message}")
 
     def on_send_message(self):
         message = self.message_entry.text().strip()
@@ -219,8 +460,9 @@ class PyQtFederatedClient(QWidget):
             return
         address = self.current_server
         if address not in self.active_chats:
-            self.active_chats[address] = []
+            self.active_chats[address] = self.load_chat_history(address)
         self.active_chats[address].append((self.client_id, message))
+        self.save_chat_history(address)
         self.display_chat(address)
         self.message_entry.clear()
         if address:
@@ -242,12 +484,51 @@ class PyQtFederatedClient(QWidget):
         remove_action = menu.addAction(f"Remove {address}")
         action = menu.exec(self.contact_list.mapToGlobal(pos))
         if action == remove_action:
-            del self.contacts[address]
-            self.save_contacts()
-            self.update_contact_list()
-            if self.current_server == address:
-                self.current_server = None
-                self.chat_display.clear()
+            # Confirm removal
+            reply = QMessageBox.question(
+                self, 
+                "Remove Contact", 
+                f"Are you sure you want to remove {address}?\nThis will also clear all chat history with this contact.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                # Remove from backend (if backend supports it)
+                try:
+                    self.backend.send_command('remove_contact', address)
+                except:
+                    pass  # Backend might not support this command yet
+                
+                # Remove from local contacts
+                del self.contacts[address]
+                self.removed_contacts.add(address)  # Add to removed contacts set
+                self.save_contacts()
+                
+                # Clear chat history for this contact
+                if address in self.active_chats:
+                    del self.active_chats[address]
+                
+                # Delete chat history file
+                chat_file = self.get_chat_history_file(address)
+                if os.path.exists(chat_file):
+                    try:
+                        os.remove(chat_file)
+                        print(f"[CLIENT-DEBUG] Deleted chat history file: {chat_file}")
+                    except Exception as e:
+                        print(f"[CLIENT-DEBUG] Failed to delete chat history: {e}")
+                
+                # Clear unread count
+                if address in self.unread_counts:
+                    del self.unread_counts[address]
+                
+                # Update UI
+                self.update_contact_list()
+                if self.current_server == address:
+                    self.current_server = None
+                    self.chat_display.clear()
+                
+                QMessageBox.information(self, "Contact Removed", f"{address} has been removed and chat history cleared.")
 
     def handle_incoming_contact_request(self, msg):
         from_addr = msg.get('from_addr')
@@ -267,6 +548,147 @@ class PyQtFederatedClient(QWidget):
             self.backend.send_command('approve_contact_request', f'{from_addr} {request_id}')
         else:
             self.backend.send_command('reject_contact_request', f'{from_addr} {request_id}')
+
+    def lock_ui(self):
+        # Disable all input and chat display
+        self.chat_display.setReadOnly(True)
+        self.message_entry.setEnabled(False)
+        self.send_button.setEnabled(False)
+        self.contact_list.setEnabled(False)
+        self.menuBarWidget.setEnabled(False)
+        self.username_label.setEnabled(False)
+        # Overlay a solid color QWidget to obscure the window
+        self.lock_overlay = QWidget(self)
+        self.lock_overlay.setStyleSheet("background-color: #222;")
+        self.lock_overlay.setGeometry(0, 0, self.width(), self.height())
+        self.lock_overlay.setAutoFillBackground(True)
+        self.lock_overlay.setWindowFlags(self.lock_overlay.windowFlags() | Qt.WindowType.SubWindow)
+        self.lock_overlay.show()
+        self.lock_overlay.raise_()
+        self.lock_overlay.setFocus()
+        # Show unlock dialog
+        while True:
+            password, ok = QInputDialog.getText(self, "Unlock", "Enter password to unlock:", QLineEdit.EchoMode.Password)
+            if not ok or not password:
+                QMessageBox.critical(self, "Error", "Password required to unlock.")
+                continue
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=self.salt,
+                iterations=390000,
+                backend=default_backend()
+            )
+            key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+            try:
+                # Try to decrypt the test file
+                if os.path.exists("chat_test.enc"):
+                    with open("chat_test.enc", "rb") as f:
+                        Fernet(key).decrypt(f.read())
+                # If successful, restore UI and set key
+                self.key = key
+                self.chat_display.setReadOnly(True)
+                self.message_entry.setEnabled(True)
+                self.send_button.setEnabled(True)
+                self.contact_list.setEnabled(True)
+                self.menuBarWidget.setEnabled(True)
+                self.username_label.setEnabled(False)
+                # Remove overlay
+                self.lock_overlay.hide()
+                self.lock_overlay.deleteLater()
+                del self.lock_overlay
+                break
+            except InvalidToken:
+                QMessageBox.critical(self, "Error", "Incorrect password. Please try again.")
+
+    def on_attach_file(self):
+        if not self.current_server:
+            QMessageBox.warning(self, "No Contact Selected", "Please select a contact to send a file.")
+            return
+        file_dialog = QFileDialog(self)
+        file_dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        if file_dialog.exec():
+            file_paths = file_dialog.selectedFiles()
+            if file_paths:
+                filepath = file_paths[0]
+                address = self.current_server
+                self.backend.send_command('send_file', f'{address} {filepath}')
+                QMessageBox.information(self, "File Sent", f"File sent to {address}: {os.path.basename(filepath)}")
+
+    def center_on_screen(self):
+        screen = QApplication.primaryScreen()
+        if screen:
+            screen_geometry = screen.availableGeometry()
+            window_geometry = self.frameGeometry()
+            center_point = screen_geometry.center()
+            window_geometry.moveCenter(center_point)
+            self.move(window_geometry.topLeft())
+
+    def show_file_progress_dialog(self, address, file_id, filename, total_size):
+        """Show a progress dialog for file transfer"""
+        from PyQt6.QtWidgets import QProgressDialog
+        from PyQt6.QtCore import Qt
+        
+        print(f"[CLIENT-DEBUG] show_file_progress_dialog called: file_id={file_id}, filename={filename}")
+        
+        # Store progress dialogs by file_id
+        if not hasattr(self, 'file_progress_dialogs'):
+            self.file_progress_dialogs = {}
+        
+        size_mb = total_size / (1024 * 1024) if total_size > 0 else 0
+        progress = QProgressDialog(f"Downloading: {filename}\nSize: {size_mb:.1f} MB", "Cancel", 0, 100, self)
+        progress.setWindowTitle("File Download Progress")
+        progress.setWindowModality(Qt.WindowModality.NonModal)  # Non-modal so user can still use the app
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setMinimumDuration(0)  # Show immediately
+        progress.show()
+        
+        self.file_progress_dialogs[file_id] = progress
+        print(f"[CLIENT-DEBUG] Progress dialog created and stored for file_id: {file_id}")
+        print(f"[CLIENT-DEBUG] Current progress dialogs: {list(self.file_progress_dialogs.keys())}")
+        
+        # Start with 0% progress
+        progress.setValue(0)
+        
+    def close_file_progress_dialog(self, file_id):
+        """Close the progress dialog for a specific file and show completion popup"""
+        if hasattr(self, 'file_progress_dialogs') and file_id in self.file_progress_dialogs:
+            progress = self.file_progress_dialogs[file_id]
+            progress.setValue(100)
+            progress.close()
+            del self.file_progress_dialogs[file_id]
+            
+            # Show completion popup
+            QMessageBox.information(self, "Download Complete", "File download has completed successfully!")
+
+    def handle_chat_link(self, url):
+        url_str = url.toString()
+        print(f"[CLIENT-DEBUG] handle_chat_link called with URL: {url_str}")
+        
+        # Handle file:// links for opening files
+        if url_str.startswith('file://'):
+            import subprocess
+            import platform
+            file_path = url_str[7:]  # Remove 'file://' prefix
+            
+            try:
+                if platform.system() == 'Windows':
+                    os.startfile(file_path)
+                elif platform.system() == 'Darwin':  # macOS
+                    subprocess.run(['open', file_path])
+                else:  # Linux
+                    subprocess.run(['xdg-open', file_path])
+                print(f"[CLIENT-DEBUG] Opened file: {file_path}")
+            except Exception as e:
+                print(f"[CLIENT-DEBUG] Failed to open file {file_path}: {e}")
+        else:
+            print(f"[CLIENT-DEBUG] Unhandled URL type: {url_str}")
+
+    def eventFilter(self, obj, event):
+        from PyQt6.QtCore import QEvent
+        # No longer needed for Accept/Decline, handled by anchorClicked
+        return super().eventFilter(obj, event)
 
 # Usage example (replace backend with your actual backend object):
 # if __name__ == "__main__":

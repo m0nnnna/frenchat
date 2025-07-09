@@ -78,12 +78,30 @@ class Federation:
 
     def handle_incoming_message(self, sock, addr):
         try:
-            data = sock.recv(65536)
-            if not data:
-                return
-            header_len = int.from_bytes(data[:4], 'big')
-            header = json.loads(data[4:4+header_len].decode('utf-8'))
-            encrypted_msg = data[4+header_len:]
+            # Read 4 bytes for header length
+            header_len_bytes = b''
+            while len(header_len_bytes) < 4:
+                chunk = sock.recv(4 - len(header_len_bytes))
+                if not chunk:
+                    return
+                header_len_bytes += chunk
+            header_len = int.from_bytes(header_len_bytes, 'big')
+            # Read header
+            header_bytes = b''
+            while len(header_bytes) < header_len:
+                chunk = sock.recv(header_len - len(header_bytes))
+                if not chunk:
+                    return
+                header_bytes += chunk
+            header = json.loads(header_bytes.decode('utf-8'))
+            # Read the rest of the payload (unknown length, so read until EOF)
+            payload = b''
+            while True:
+                chunk = sock.recv(1048576)  # 1MB at a time
+                if not chunk:
+                    break
+                payload += chunk
+            encrypted_msg = payload
             sender_addr = header.get('server_addr', f"{addr[0]}:{addr[1]}")
             sender_pem = header.get('public_key')
             with self.lock:
@@ -110,11 +128,21 @@ class Federation:
             except Exception as e:
                 try:
                     msg_data = json.loads(encrypted_msg.decode('utf-8'))
-                    print(f"[FEDERATION] Received unencrypted message from {sender_addr}: {msg_data}")
+                    # print(f"[FEDERATION] Received unencrypted message from {sender_addr}: type={msg_data['type']}")
+                    if isinstance(msg_data, dict) and 'type' in msg_data:
+                        if msg_data['type'].startswith('file_'):
+                            print(f"[FEDERATION] Received unencrypted file message from {sender_addr}: type={msg_data['type']} file_id={msg_data.get('file_id')}")
+                        else:
+                            print(f"[FEDERATION] Received unencrypted message from {sender_addr}: type={msg_data['type']}")
                 except Exception as e2:
                     print(f"[FEDERATION] Decrypt and JSON parse error from {sender_addr}: {e} / {e2}")
                     return
-            print(f"[FEDERATION] Received from {sender_addr}: {msg_data}")
+            # print(f"[FEDERATION] Received from {sender_addr}: {msg_data}")
+            if isinstance(msg_data, dict) and 'type' in msg_data:
+                if msg_data['type'].startswith('file_'):
+                    print(f"[FEDERATION] Received file message from {sender_addr}: type={msg_data['type']} file_id={msg_data.get('file_id')}")
+                else:
+                    print(f"[FEDERATION] Received message from {sender_addr}: type={msg_data['type']}")
             # Handle contact request/response
             if msg_data.get('type') == 'contact_request':
                 self.handle_contact_request(msg_data, sender_addr)
@@ -128,13 +156,39 @@ class Federation:
         finally:
             sock.close()
 
-    def send_message(self, address, port, message, peer_key=None):
-        # peer_key is optional; if not provided, use known_servers
+    def send_message(self, address, port, message, peer_key=None, plaintext=False):
+        # If plaintext is True, send the message as JSON without encryption
+        if plaintext:
+            try:
+                print(f"[FEDERATION-DEBUG] Sending PLAINTEXT message to {address}: {message}")
+                header = {
+                    'server_addr': f"{self.host}:{self.port}",
+                    'public_key': enc.serialize_public_key(self.public_key)
+                }
+                header_bytes = json.dumps(header).encode('utf-8')
+                header_len = len(header_bytes).to_bytes(4, 'big')
+                payload = header_len + header_bytes + json.dumps(message).encode('utf-8')
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.connect((address.split(':')[0], int(port)))
+                    s.sendall(payload)
+                # print(f"[FEDERATION] Sent PLAINTEXT message to {address}: type={message['type']}")
+                if isinstance(message, dict) and 'type' in message:
+                    if message['type'].startswith('file_'):
+                        print(f"[FEDERATION] Sent PLAINTEXT file message to {address}: type={message['type']} file_id={message.get('file_id')}")
+                    else:
+                        print(f"[FEDERATION] Sent PLAINTEXT message to {address}: type={message['type']}")
+                return True
+            except Exception as e:
+                print(f"[FEDERATION] Send error to {address} (PLAINTEXT): {e}")
+                print(f"[FEDERATION] Message type: {message.get('type')}")
+                return False
+        # Otherwise, encrypt as before
         with self.lock:
             if peer_key is None:
                 peer_key = self.known_servers.get(address)
         if not peer_key:
-            print(f"[FEDERATION] No known public key for {address}. Cannot send message.")
+            print(f"[FEDERATION] No known public key for {address}. Cannot send message. Message type: {message.get('type')}, port: {port}")
+            print(f"[FEDERATION] Known servers: {list(self.known_servers.keys())}")
             return False
         try:
             header = {
@@ -143,15 +197,28 @@ class Federation:
             }
             header_bytes = json.dumps(header).encode('utf-8')
             header_len = len(header_bytes).to_bytes(4, 'big')
-            encrypted = enc.rsa_encrypt(peer_key, json.dumps(message).encode('utf-8'))
+            print(f"[FEDERATION] Attempting to encrypt message for {address} (type: {message.get('type')})")
+            data_to_encrypt = json.dumps(message).encode('utf-8')
+            print(f"[FEDERATION] About to encrypt: type={type(data_to_encrypt)}, len={len(data_to_encrypt)}")
+            print(f"[FEDERATION] Peer key type: {type(peer_key)}")
+            encrypted = enc.rsa_encrypt(peer_key, data_to_encrypt)
             payload = header_len + header_bytes + encrypted
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.connect((address.split(':')[0], int(port)))
                 s.sendall(payload)
-            print(f"[FEDERATION] Sent stateless message to {address}:{port}: {message}")
+            # print(f"[FEDERATION] Sent stateless message to {address}: {message}")
+            if isinstance(message, dict) and 'type' in message:
+                if message['type'].startswith('file_'):
+                    print(f"[FEDERATION] Sent stateless file message to {address}: type={message['type']} file_id={message.get('file_id')}")
+                else:
+                    print(f"[FEDERATION] Sent stateless message to {address}: type={message['type']}")
             return True
         except Exception as e:
-            print(f"[FEDERATION] Send error to {address}:{port}: {e}")
+            import traceback
+            print(f"[FEDERATION] Send error to {address}: {e}")
+            traceback.print_exc()
+            print(f"[FEDERATION] Message type: {message.get('type')}, peer_key: {peer_key}")
+            print(f"[FEDERATION] Data type: {type(json.dumps(message).encode('utf-8'))}, Data len: {len(json.dumps(message).encode('utf-8'))}")
             return False
 
     def send_contact_request(self, address, port):
@@ -174,10 +241,10 @@ class Federation:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.connect((address.split(':')[0], int(port)))
                 s.sendall(payload)
-            print(f"[FEDERATION] Sent contact request to {address}:{port}")
+            print(f"[FEDERATION] Sent contact request to {address}")
             return request_id
         except Exception as e:
-            print(f"[FEDERATION] Contact request error to {address}:{port}: {e}")
+            print(f"[FEDERATION] Contact request error to {address}: {e}")
             return None
 
     def handle_contact_request(self, msg, sender_addr):
