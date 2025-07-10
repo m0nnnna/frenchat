@@ -121,36 +121,28 @@ Choose option 3: "Start server + client (normal operation)"
    - Users on different servers will appear in your client list
    - Request chats normally - messages are routed through the federated network
 
-## Configuration
-
-Edit `config.conf`:
-```ini
-[Network]
-host = 192.168.0.98  # Your server IP or domain
-port = 8443
-public_ip =          # Your server port (443 for domains)
-```
-
 ### Network Configuration Examples
 
 **Local Network**:
 ```ini
-host = 192.168.0.100
+[Network]
+host = 192.168.0.98
 port = 8443
-# public_ip not needed
+public_ip = 
 ```
 
 **Public IP** (if you want your server to be directly accessible from the internet):
 ```ini
-host = 192.168.0.100  # Local IP of your machine
-port = 8443           # Local port your server listens on
-public_ip = 203.0.113.10  # Your public IP (used for federation)
+host = 192.168.0.100  
+port = 8443           
+public_ip = 203.0.113.10  
 ```
 
 **Domain with nginx (recommended for domains):**
 ```ini
-host = 127.0.0.1      # Local IP (do not use your domain here)
-port = 8443           # Local port your server listens on
+host = 192.168.0.98    
+port = 8443
+public_ip =           
 # public_ip not needed
 ```
 Set up nginx (or another reverse proxy) to forward traffic from your domain to your local server as described above in the 'Using a Domain or Domain with Proxy' section.
