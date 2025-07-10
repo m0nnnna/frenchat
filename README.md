@@ -84,7 +84,7 @@ Choose option 3: "Start server + client (normal operation)"
 
 ### Adding Contacts
 
-1. **Add Contact**: Click "Add Contact" and enter the server address (host:port)
+1. **Add Contact**: Click the 3 line menu then "Add Contact" and enter the server address (host:port)
 2. **Contact Request**: The other user will receive a contact request popup
 3. **Key Approval**: If it's a new contact, approve their public key
 4. **Contact Added**: The contact appears in your contact list
@@ -127,8 +127,8 @@ Edit `config.conf`:
 ```ini
 [Network]
 host = 192.168.0.98  # Your server IP or domain
-port = 8443          # Your server port (443 for domains)
-client_id = alice    # Your unique client/server ID
+port = 8443
+public_ip =          # Your server port (443 for domains)
 ```
 
 ### Network Configuration Examples
@@ -137,22 +137,23 @@ client_id = alice    # Your unique client/server ID
 ```ini
 host = 192.168.0.100
 port = 8443
-client_id = alice
+# public_ip not needed
 ```
 
-**Public IP**:
+**Public IP** (if you want your server to be directly accessible from the internet):
 ```ini
-host = 203.0.113.10
-port = 8443
-client_id = bob
+host = 192.168.0.100  # Local IP of your machine
+port = 8443           # Local port your server listens on
+public_ip = 203.0.113.10  # Your public IP (used for federation)
 ```
 
-**Domain with Cloudflare**:
+**Domain with nginx (recommended for domains):**
 ```ini
-host = chat.example.com
-port = 443
-client_id = charlie
+host = 127.0.0.1      # Local IP (do not use your domain here)
+port = 8443           # Local port your server listens on
+# public_ip not needed
 ```
+Set up nginx (or another reverse proxy) to forward traffic from your domain to your local server as described above in the 'Using a Domain or Domain with Proxy' section.
 
 ## File Transfer Protocol
 
@@ -208,6 +209,33 @@ This will create config files for multiple servers on different ports. Then:
 - **Password Protection**: Chat history encrypted with user-provided password
 - **Federated Security**: Each server manages its own security and keys
 - **No Central Authority**: Decentralized network with no single point of failure
+- **Chunked File Transfer**: Large files are split into manageable chunks for reliability
+- **Progress Tracking**: Real-time progress updates during file transfer
+- **Error Handling**: Robust error handling and recovery
+
+### Network Configuration Examples
+
+**Local Network**:
+```ini
+host = 192.168.0.100
+port = 8443
+# public_ip not needed
+```
+
+**Public IP** (if you want your server to be directly accessible from the internet):
+```ini
+host = 192.168.0.100  # Local IP of your machine
+port = 8443           # Local port your server listens on
+public_ip = 203.0.113.10  # Your public IP (used for federation)
+```
+
+**Domain with nginx (recommended for domains):**
+```ini
+host = 127.0.0.1      # Local IP (do not use your domain here)
+port = 8443           # Local port your server listens on
+# public_ip not needed
+```
+Set up nginx (or another reverse proxy) to forward traffic from your domain to your local server as described above in the 'Using a Domain or Domain with Proxy' section.
 
 ## Network Topology
 
@@ -284,3 +312,32 @@ Server D ←→ Server E ←→ Server F
 - **Automatic Saving**: Messages saved automatically
 - **Persistent Storage**: Chat history survives application restarts
 - **Contact-Specific**: Separate history for each contact 
+
+## Using a Domain or Domain with Proxy
+
+If you want to use a domain (e.g., `chat.example.com`) or run your server behind a proxy (such as nginx), you should:
+
+- **Set your `config.conf` file to use your local IP and port** (e.g., `host = 127.0.0.1`, `port = 8443`).
+- **Do not set the host to your public domain name in the conf file.**
+- **Use nginx (or another reverse proxy)** to forward traffic from your domain (port 443 or 80) to your local server's IP and port.
+
+Example nginx config:
+```nginx
+server {
+    listen 443 ssl;
+    server_name chat.example.com;
+
+    ssl_certificate /path/to/fullchain.pem;
+    ssl_certificate_key /path/to/privkey.pem;
+
+    location / {
+        proxy_pass https://127.0.0.1:8443;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+This allows you to keep your chat server running on a local IP and port, while making it accessible via your public domain securely through nginx. 
