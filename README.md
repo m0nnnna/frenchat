@@ -76,51 +76,6 @@ pip install cryptography pyopenssl PyQt6
 python chat_app.py
 ```
 
-**Or use the test script**:
-```bash
-python test_chat.py
-```
-Choose option 3: "Start server + client (normal operation)"
-
-### Adding Contacts
-
-1. **Add Contact**: Click the 3 line menu then "Add Contact" and enter the server address (host:port)
-2. **Contact Request**: The other user will receive a contact request popup
-3. **Key Approval**: If it's a new contact, approve their public key
-4. **Contact Added**: The contact appears in your contact list
-
-### File Transfer
-
-1. **Attach File**: Click the paperclip icon to select a file
-2. **File Offer**: The recipient receives a popup asking to accept/decline
-3. **Accept/Decline**: Recipient can accept or decline the file transfer
-4. **Progress Tracking**: If accepted, a progress bar shows download progress
-5. **Completion**: Popup notification when download completes
-6. **Open File**: Click the file link in chat to open the downloaded file
-
-### Chat Interface
-
-1. **Select Contact**: Click on a contact in the contact list
-2. **Send Messages**: Type in the message box and press Enter or click Send
-3. **View History**: Chat history is automatically loaded and displayed
-4. **File Attachments**: Use the paperclip icon to send files
-5. **Remove Contacts**: Right-click a contact and select "Remove" to delete
-
-### Connecting to Other Servers
-
-1. **Get server details** from other users:
-   - Host (IP or domain)
-   - Port (443 for domains, custom for IPs)
-   - Server ID (their client ID)
-
-2. **Connect via GUI**:
-   - Enter the host, port, and server ID in the "Federated Servers" section
-   - Click "Connect to Server"
-
-3. **Chat across servers**:
-   - Users on different servers will appear in your client list
-   - Request chats normally - messages are routed through the federated network
-
 ### Network Configuration Examples
 
 **Local Network**:
@@ -143,7 +98,6 @@ public_ip = 203.0.113.10
 host = 192.168.0.98    
 port = 8443
 public_ip =           
-# public_ip not needed
 ```
 Set up nginx (or another reverse proxy) to forward traffic from your domain to your local server as described above in the 'Using a Domain or Domain with Proxy' section.
 
@@ -183,52 +137,6 @@ This will create config files for multiple servers on different ports. Then:
 3. **Test cross-server chat** between users on different servers
 4. **Test file transfers** across the federated network
 
-## Commands
-
-- **Add Contact**: Add new contacts to your contact list
-- **Remove Contact**: Right-click to remove contacts and clear chat history
-- **Send File**: Click the paperclip icon to send files
-- **Lock UI**: Lock the interface with password protection
-- **Refresh Contacts**: Update the contact list from the backend
-
-## Security Features
-
-- **RSA-2048 Encryption**: All messages encrypted with strong RSA encryption
-- **AES-GCM File Encryption**: Files encrypted with authenticated encryption
-- **TLS/SSL**: Secure connections between servers and clients
-- **Key Verification**: Clients verify server keys to prevent man-in-the-middle attacks
-- **Contact Approval**: Users must explicitly approve contact requests
-- **Password Protection**: Chat history encrypted with user-provided password
-- **Federated Security**: Each server manages its own security and keys
-- **No Central Authority**: Decentralized network with no single point of failure
-- **Chunked File Transfer**: Large files are split into manageable chunks for reliability
-- **Progress Tracking**: Real-time progress updates during file transfer
-- **Error Handling**: Robust error handling and recovery
-
-### Network Configuration Examples
-
-**Local Network**:
-```ini
-host = 192.168.0.100
-port = 8443
-# public_ip not needed
-```
-
-**Public IP** (if you want your server to be directly accessible from the internet):
-```ini
-host = 192.168.0.100  # Local IP of your machine
-port = 8443           # Local port your server listens on
-public_ip = 203.0.113.10  # Your public IP (used for federation)
-```
-
-**Domain with nginx (recommended for domains):**
-```ini
-host = 127.0.0.1      # Local IP (do not use your domain here)
-port = 8443           # Local port your server listens on
-# public_ip not needed
-```
-Set up nginx (or another reverse proxy) to forward traffic from your domain to your local server as described above in the 'Using a Domain or Domain with Proxy' section.
-
 ## Network Topology
 
 The federated network can form various topologies:
@@ -244,11 +152,6 @@ Server A ←→ Server B ←→ Server C
    ↕         ↕         ↕
 Server D ←→ Server E ←→ Server F
 ```
-
-- **Direct connections** between servers
-- **Message routing** through the network
-- **Automatic discovery** of users on connected servers
-- **Resilient** - if one server goes down, others can still communicate
 
 ## Troubleshooting
 
@@ -285,51 +188,3 @@ Server D ←→ Server E ←→ Server F
 6. **File transfers with progress**: Progress bar shows download progress
 7. **Bob receives file**: Completion popup, file ready to open
 8. **Chat across servers**: Messages routed through federated network
-
-## Technical Details
-
-### Encryption
-- **RSA-2048**: For message encryption and key exchange
-- **AES-GCM**: For file encryption with authentication
-- **TLS/SSL**: For transport layer security
-
-### File Transfer
-- **Chunk Size**: 99MB per chunk for large file support
-- **Progress Tracking**: Real-time progress updates
-- **Error Recovery**: Automatic retry and error handling
-- **Cleanup**: Temporary files automatically cleaned up
-
-### Chat History
-- **AES Encryption**: Chat history encrypted with user password
-- **Automatic Saving**: Messages saved automatically
-- **Persistent Storage**: Chat history survives application restarts
-- **Contact-Specific**: Separate history for each contact 
-
-## Using a Domain or Domain with Proxy
-
-If you want to use a domain (e.g., `chat.example.com`) or run your server behind a proxy (such as nginx), you should:
-
-- **Set your `config.conf` file to use your local IP and port** (e.g., `host = 127.0.0.1`, `port = 8443`).
-- **Do not set the host to your public domain name in the conf file.**
-- **Use nginx (or another reverse proxy)** to forward traffic from your domain (port 443 or 80) to your local server's IP and port.
-
-Example nginx config:
-```nginx
-server {
-    listen 443 ssl;
-    server_name chat.example.com;
-
-    ssl_certificate /path/to/fullchain.pem;
-    ssl_certificate_key /path/to/privkey.pem;
-
-    location / {
-        proxy_pass https://127.0.0.1:8443;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-```
-
-This allows you to keep your chat server running on a local IP and port, while making it accessible via your public domain securely through nginx. 
