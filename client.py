@@ -16,12 +16,42 @@ import os
 import secrets
 import mimetypes
 from PyQt6.QtGui import QDesktopServices
+from room_client import RoomClient
 
 class PyQtFederatedClient(QWidget):
+    def save_joined_rooms(self):
+        # Save the list of joined room IDs
+        try:
+            with open(self.rooms_file, 'w') as f:
+                json.dump({'rooms': list(self.room_client.rooms.keys())}, f)
+        except Exception as e:
+            print(f"[CLIENT-DEBUG] Failed to save joined rooms: {e}")
+
+    def load_joined_rooms(self):
+        # Load and auto-join rooms from file
+        try:
+            if os.path.exists(self.rooms_file):
+                with open(self.rooms_file, 'r') as f:
+                    data = json.load(f)
+                    for room_id in data.get('rooms', []):
+                        self.room_client.join_room(room_id)
+                        # Load history from disk into memory
+                        self.room_client.room_histories[room_id] = self.load_room_history(room_id)
+        except Exception as e:
+            print(f"[CLIENT-DEBUG] Failed to load joined rooms: {e}")
+
     def __init__(self, backend, client_id=None):
-        super().__init__()
+        # RoomClient integration (must be first!)
         self.backend = backend
         self.client_id = client_id or backend.client_id
+        self.room_client = RoomClient(
+            user_id=self.client_id,
+            send_func=self.send_room_command
+        )
+        self.room_client.set_on_room_update(self.on_room_update)
+        self.room_client.set_on_room_message(self.on_room_message)
+        self.room_client.set_on_file_offer(self.on_room_file_offer)
+        super().__init__()
         self.setWindowTitle(f"Federated Chat Client (PyQt6) - {self.client_id}")
         self.resize(700, 500)
         self.contacts = {}
@@ -32,12 +62,14 @@ class PyQtFederatedClient(QWidget):
         self.pending_contact_key_approval = set()
         self.automated_message_sent = set()
         self.contacts_file = f'contacts_{self.client_id}.json'
+        self.rooms_file = f'rooms_{self.client_id}.json'  # For room persistence
         self.salt_file = "chat_salt.bin"
         self.salt = self.load_or_create_salt()
         # Center the window before showing password prompt
         self.center_on_screen()
         self.key = self.prompt_for_password_and_derive_key()
         self.load_contacts()
+        self.load_joined_rooms()  # Load and auto-join rooms
         self.load_all_chat_histories()
         self.clear_old_html_messages() # Call the new method here
         self.init_ui()
@@ -112,6 +144,33 @@ class PyQtFederatedClient(QWidget):
             print(f"[CLIENT-DEBUG] Failed to load chat history for {address}: {e}")
             return []
 
+    def get_room_history_file(self, room_id):
+        return f"room_{room_id}.enc"
+
+    def save_room_history(self, room_id):
+        file = self.get_room_history_file(room_id)
+        messages = self.room_client.get_room_history(room_id)
+        try:
+            data = json.dumps(messages).encode()
+            encrypted = Fernet(self.key).encrypt(data)
+            with open(file, "wb") as f:
+                f.write(encrypted)
+        except Exception as e:
+            print(f"[CLIENT-DEBUG] Failed to save room history for {room_id}: {e}")
+
+    def load_room_history(self, room_id):
+        file = self.get_room_history_file(room_id)
+        if not os.path.exists(file):
+            return []
+        try:
+            with open(file, "rb") as f:
+                encrypted = f.read()
+            data = Fernet(self.key).decrypt(encrypted)
+            return json.loads(data.decode())
+        except Exception as e:
+            print(f"[CLIENT-DEBUG] Failed to load room history for {room_id}: {e}")
+            return []
+
     def clear_old_html_messages(self):
         """Clear old chat history that contains HTML Accept/Decline messages"""
         for address in list(self.active_chats.keys()):
@@ -143,6 +202,8 @@ class PyQtFederatedClient(QWidget):
         self.menu = QMenu("Menu", self)
         self.menu_bar.addAction(self.menu.menuAction())
         self.menu.addAction("Add Contact", self.on_add_contact)
+        self.menu.addAction("Create Room", self.on_create_room)
+        self.menu.addAction("Join Room", self.on_join_room)
         self.menu.addAction("Lock", self.lock_ui)
         self.menuBarWidget = QPushButton("☰ Menu")
         self.menuBarWidget.setMenu(self.menu)
@@ -228,21 +289,30 @@ class PyQtFederatedClient(QWidget):
         prev_address = self.current_server
         self.contact_list.blockSignals(True)
         self.contact_list.clear()
+        # Combine contacts and rooms for display
         addresses = sorted(self.contacts.keys(), key=lambda x: self.contacts[x])
+        room_ids = sorted(self.room_client.rooms.keys())
+        display_items = []
+        for room_id in room_ids:
+            room = self.room_client.rooms[room_id]
+            name = room.get('name', room_id)
+            display = f"# {name} [{room_id[:6]}]"
+            display_items.append((room_id, display, True))  # True = is_room
         for address, username in sorted(self.contacts.items(), key=lambda x: x[1]):
-            unread = self.unread_counts.get(address, 0)
-            if username == address:
-                display = f"{address}"
-            else:
-                display = f"{username} ({address})"
+            display = f"{username} ({address})" if username != address else address
+            display_items.append((address, display, False))  # False = is_room
+        for idx, (addr, display, is_room) in enumerate(display_items):
+            unread = self.unread_counts.get(addr, 0)
             if unread > 0:
                 item = QListWidgetItem(f"{display} [{unread}]")
             else:
                 item = QListWidgetItem(f"{display}")
+            item.setData(Qt.ItemDataRole.UserRole, {'is_room': is_room, 'id': addr})
             self.contact_list.addItem(item)
         # Restore previous selection if possible
-        if prev_address in addresses:
-            idx = addresses.index(prev_address)
+        all_ids = [x[0] for x in display_items]
+        if prev_address in all_ids:
+            idx = all_ids.index(prev_address)
             self.contact_list.setCurrentRow(idx)
         self.contact_list.blockSignals(False)
 
@@ -271,6 +341,37 @@ class PyQtFederatedClient(QWidget):
             print(f"[CLIENT-DEBUG] poll_backend received: {msg}")
             msg_type = msg.get('type')
             print(f"[CLIENT-DEBUG] Message type: {msg_type}")
+            # Handle federated room join response
+            if msg_type == 'federated_room_join_response':
+                if msg.get('success') and 'room' in msg:
+                    room = msg['room']
+                    self.room_client.rooms[room['room_id']] = room
+                    # Deduplicate and save history
+                    seen = set()
+                    deduped = []
+                    for m in room.get('history', []):
+                        mid = m.get('msg_id')
+                        if mid and mid not in seen:
+                            deduped.append(m)
+                            seen.add(mid)
+                    self.room_client.room_histories[room['room_id']] = deduped
+                    self.save_room_history(room['room_id'])
+                    self.save_joined_rooms()  # <-- Ensure joined rooms are persisted
+                    # (Removed: do not add all room members as contacts)
+                    self.update_contact_list()
+                    self.display_room_chat(room['room_id'])
+                    QMessageBox.information(self, "Room Joined", f"Successfully joined room: {room.get('name', room['room_id'])}")
+                else:
+                    QMessageBox.warning(self, "Join Failed", msg.get('error', 'Unknown error'))
+                return
+            # Room protocol message routing
+            if msg_type in [
+                'room_create_success', 'room_create_error', 'room_join_success', 'room_join_error',
+                'room_leave_success', 'room_message', 'room_history_response', 'room_file_offer',
+                # Add more room protocol types as needed
+            ]:
+                self.room_client.handle_incoming_room_message(msg)
+                return
             if msg_type == 'chat_message':
                 address = msg.get('from_server') or msg.get('address')
                 from_client = msg.get('from_client', address)
@@ -479,17 +580,76 @@ class PyQtFederatedClient(QWidget):
         self.backend.send_command('contact_request', address)
         QMessageBox.information(self, "Contact Request", f"Contact request sent to {address}. Awaiting approval.")
 
+    def on_create_room(self):
+        name, ok = QInputDialog.getText(self, "Create Room", "Enter room name:")
+        if not ok or not name:
+            return
+        is_private, ok = QInputDialog.getItem(self, "Room Privacy", "Select room type:", ["Public", "Private"], 0, False)
+        if not ok:
+            return
+        password = None
+        if is_private == "Private":
+            password, ok = QInputDialog.getText(self, "Room Password", "Set a password for the room:", QLineEdit.EchoMode.Password)
+            if not ok or not password:
+                return
+        self.room_client.create_room(name, is_private == "Private", password)
+
+    def on_join_room(self):
+        room_id, ok = QInputDialog.getText(self, "Join Room", "Enter room ID:")
+        if not ok or not room_id:
+            return
+        server_addr, ok = QInputDialog.getText(self, "Join Room", "Enter server address (host:port) of a member:")
+        if not ok or not server_addr:
+            return
+        password = None
+        # Check if the room is private (if known)
+        room = self.room_client.get_room(room_id)
+        if room and room.get('is_private'):
+            password, ok = QInputDialog.getText(self, "Room Password", "Enter room password:", QLineEdit.EchoMode.Password)
+            if not ok or not password:
+                return
+        # Get our own server address
+        joiner_server = None
+        if hasattr(self.backend, 'host') and hasattr(self.backend, 'port'):
+            joiner_server = f"{self.backend.host}:{self.backend.port}"
+        # Send federated join request to the specified server
+        join_request = {
+            'type': 'federated_room_join_request',
+            'room_id': room_id,
+            'password': password,
+            'joiner_id': self.client_id,
+            'joiner_server': joiner_server
+        }
+        try:
+            host, port = server_addr.split(':')
+            port = int(port)
+            # Use backend's federation to send the message
+            if hasattr(self.backend, 'federation'):
+                self.backend.federation.send_message(server_addr, port, join_request, plaintext=True)
+            else:
+                QMessageBox.warning(self, "Federation Error", "Federation not available in backend.")
+        except Exception as e:
+            QMessageBox.warning(self, "Federation Error", f"Failed to send join request: {e}")
+
     def on_select_contact(self, current, previous):
         if current is None:
             return
         idx = self.contact_list.currentRow()
-        address = list(sorted(self.contacts.keys(), key=lambda x: self.contacts[x]))[idx]
-        self.current_server = address
-        self.unread_counts[address] = 0
-        self.update_contact_list()
-        if address not in self.active_chats:
-            self.active_chats[address] = self.load_chat_history(address)
-        self.display_chat(address)
+        item = self.contact_list.item(idx)
+        if not item:
+            return
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if data and data.get('is_room'):
+            self.current_server = data['id']
+            self.display_room_chat(data['id'])
+        else:
+            address = list(sorted(self.contacts.keys(), key=lambda x: self.contacts[x]))[idx - len(self.room_client.rooms)] if idx >= len(self.room_client.rooms) else None
+            self.current_server = address
+            self.unread_counts[address] = 0
+            self.update_contact_list()
+            if address not in self.active_chats:
+                self.active_chats[address] = self.load_chat_history(address)
+            self.display_chat(address)
 
     def display_chat(self, address):
         self.chat_display.clear()
@@ -549,6 +709,14 @@ class PyQtFederatedClient(QWidget):
             print("[CLIENT-DEBUG] on_send_message: No message or no contact selected.")
             return
         address = self.current_server
+        # Check if this is a room
+        if address in self.room_client.rooms:
+            # Send to room, but do NOT add to history immediately (wait for server broadcast)
+            msg_id = secrets.token_hex(8)
+            self.room_client.send_room_message(address, {'sender': self.client_id, 'text': message, 'msg_id': msg_id})
+            self.message_entry.clear()
+            return
+        # Normal contact message
         if address not in self.active_chats:
             self.active_chats[address] = self.load_chat_history(address)
         self.active_chats[address].append((self.client_id, message))
@@ -569,56 +737,60 @@ class PyQtFederatedClient(QWidget):
         idx = self.contact_list.indexAt(pos).row()
         if idx < 0:
             return
-        address = list(sorted(self.contacts.keys(), key=lambda x: self.contacts[x]))[idx]
-        menu = QMenu()
-        remove_action = menu.addAction(f"Remove {address}")
-        action = menu.exec(self.contact_list.mapToGlobal(pos))
-        if action == remove_action:
-            # Confirm removal
-            reply = QMessageBox.question(
-                self, 
-                "Remove Contact", 
-                f"Are you sure you want to remove {address}?\nThis will also clear all chat history with this contact.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-            
-            if reply == QMessageBox.StandardButton.Yes:
-                # Remove from backend (if backend supports it)
-                try:
-                    self.backend.send_command('remove_contact', address)
-                except:
-                    pass  # Backend might not support this command yet
-                
-                # Remove from local contacts
-                del self.contacts[address]
-                self.removed_contacts.add(address)  # Add to removed contacts set
-                self.save_contacts()
-                
-                # Clear chat history for this contact
-                if address in self.active_chats:
-                    del self.active_chats[address]
-                
-                # Delete chat history file
-                chat_file = self.get_chat_history_file(address)
-                if os.path.exists(chat_file):
+        item = self.contact_list.item(idx)
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if data and data.get('is_room'):
+            room_id = data['id']
+            menu = QMenu()
+            leave_action = menu.addAction(f"Leave Room {room_id}")
+            action = menu.exec(self.contact_list.mapToGlobal(pos))
+            if action == leave_action:
+                self.room_client.leave_room(room_id)
+        else:
+            address = data['id'] if data else None
+            menu = QMenu()
+            remove_action = menu.addAction(f"Remove {address}")
+            action = menu.exec(self.contact_list.mapToGlobal(pos))
+            if action == remove_action:
+                # Confirm removal
+                reply = QMessageBox.question(
+                    self, 
+                    "Remove Contact", 
+                    f"Are you sure you want to remove {address}?\nThis will also clear all chat history with this contact.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    # Remove from backend (if backend supports it)
                     try:
-                        os.remove(chat_file)
-                        print(f"[CLIENT-DEBUG] Deleted chat history file: {chat_file}")
-                    except Exception as e:
-                        print(f"[CLIENT-DEBUG] Failed to delete chat history: {e}")
-                
-                # Clear unread count
-                if address in self.unread_counts:
-                    del self.unread_counts[address]
-                
-                # Update UI
-                self.update_contact_list()
-                if self.current_server == address:
-                    self.current_server = None
-                    self.chat_display.clear()
-                
-                QMessageBox.information(self, "Contact Removed", f"{address} has been removed and chat history cleared.")
+                        self.backend.send_command('remove_contact', address)
+                    except:
+                        pass  # Backend might not support this command yet
+                    # Remove from local contacts
+                    if address in self.contacts:
+                        del self.contacts[address]
+                    self.removed_contacts.add(address)  # Add to removed contacts set
+                    self.save_contacts()
+                    # Clear chat history for this contact
+                    if address in self.active_chats:
+                        del self.active_chats[address]
+                    # Delete chat history file
+                    chat_file = self.get_chat_history_file(address)
+                    if os.path.exists(chat_file):
+                        try:
+                            os.remove(chat_file)
+                            print(f"[CLIENT-DEBUG] Deleted chat history file: {chat_file}")
+                        except Exception as e:
+                            print(f"[CLIENT-DEBUG] Failed to delete chat history: {e}")
+                    # Clear unread count
+                    if address in self.unread_counts:
+                        del self.unread_counts[address]
+                    # Update UI
+                    self.update_contact_list()
+                    if self.current_server == address:
+                        self.current_server = None
+                        self.chat_display.clear()
+                    QMessageBox.information(self, "Contact Removed", f"{address} has been removed and chat history cleared.")
 
     def handle_incoming_contact_request(self, msg):
         from_addr = msg.get('from_addr')
@@ -823,6 +995,57 @@ class PyQtFederatedClient(QWidget):
             return f'<div style="margin: 5px 0; padding: 10px; background: rgba(0,0,0,0.05); border-radius: 8px; border: 1px solid rgba(0,0,0,0.1);"><a href="file://{filepath}" style="text-decoration: none; color: #007bff;">🎬 {filename}</a><br><small style="color: inherit; opacity: 0.7;">Click to play video</small></div>'
         
         return None
+
+    def send_room_command(self, msg: dict):
+        """Send a room protocol message to the backend/server."""
+        self.backend.send_command('room_protocol', msg)
+
+    # --- RoomClient UI callback stubs ---
+    def on_room_update(self, room_dict):
+        print(f"[ROOM-DEBUG] Room update: {room_dict}")
+        self.update_contact_list()
+        self.save_joined_rooms()
+        # --- Fix: update room history if present ---
+        if 'room_id' in room_dict and 'history' in room_dict:
+            room_id = room_dict['room_id']
+            history = room_dict['history']
+            # Deduplicate by msg_id
+            seen = set()
+            deduped = []
+            for msg in history:
+                mid = msg.get('msg_id')
+                if mid and mid not in seen:
+                    deduped.append(msg)
+                    seen.add(mid)
+            self.room_client.room_histories[room_id] = deduped
+            self.save_room_history(room_id)
+            if self.current_server == room_id:
+                self.display_room_chat(room_id)
+
+    def on_room_message(self, room_id, message_dict):
+        print(f"[ROOM-CLIENT-DEBUG] on_room_message: room_id={room_id}, msg_id={message_dict.get('msg_id')}")
+        # Only add message if msg_id is new (avoid duplicates)
+        history = self.room_client.get_room_history(room_id)
+        msg_ids = {msg.get('msg_id') for msg in history if isinstance(msg, dict)}
+        if message_dict.get('msg_id') not in msg_ids:
+            self.room_client.room_histories.setdefault(room_id, []).append(message_dict)
+            if len(self.room_client.room_histories[room_id]) > 1000:
+                self.room_client.room_histories[room_id] = self.room_client.room_histories[room_id][-1000:]
+            self.save_room_history(room_id)
+        self.display_room_chat(room_id)
+
+    def on_room_file_offer(self, room_id, file_offer):
+        # TODO: Show file offer popup for room file transfer
+        print(f"[ROOM-DEBUG] File offer in room {room_id}: {file_offer}")
+
+    def display_room_chat(self, room_id):
+        self.chat_display.clear()
+        messages = self.room_client.get_room_history(room_id)
+        print(f"[ROOM-CLIENT-DEBUG] display_room_chat: {len(messages)} messages, msg_ids={[m.get('msg_id') for m in messages if isinstance(m, dict)]}")
+        for msg in messages:
+            sender = msg.get('sender', '')
+            message = msg.get('text', '')
+            self.chat_display.append(f"<b>{sender}:</b> {message}")
 
 # Usage example (replace backend with your actual backend object):
 # if __name__ == "__main__":

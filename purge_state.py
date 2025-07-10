@@ -3,7 +3,7 @@ import os
 # Files to keep
 KEEP_FILES = {'config.conf'}
 # File extensions to delete
-DELETE_EXTENSIONS = {'.json', '.txt', '.pem'}
+DELETE_EXTENSIONS = {'.json', '.txt', '.enc', '.bin', '.pem'}
 # Specific files to delete
 DELETE_FILES = {'server.crt', 'server.key'}
 

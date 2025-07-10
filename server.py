@@ -8,6 +8,7 @@ import media_utils
 import secrets
 import re
 import uuid
+from room_server import RoomManager, handle_room_message
 
 def sanitize_filename(filename):
     # Remove or replace characters not allowed on Windows
@@ -30,7 +31,14 @@ class ServerBackend:
         self.federation.register_message_handler(self.handle_federated_message)
         self.federation.start()
         self.pending_file_offers = {}
+        self.room_manager = RoomManager()  # Add this line
         print(f"[SERVER] Backend started for {client_id} on {host}:{port}")
+        # --- On startup, resync userlists for all rooms ---
+        local_server_addr = f"{self.host}:{self.port}"
+        from room_server import send_userlist_request, send_history_request
+        for room_id in self.room_manager.rooms:
+            send_userlist_request(self.room_manager, room_id, self.federation, local_server_addr)
+            send_history_request(self.room_manager, room_id, self.federation, local_server_addr)
 
     def load_or_generate_keys(self):
         key_file = 'server_private_key.pem'
@@ -284,6 +292,119 @@ class ServerBackend:
                     self.outbox.put({'type': 'info', 'message': f'Sent file {filepath} to {address} as {file_id}.'})
                 else:
                     self.outbox.put({'type': 'info', 'message': f'File offer declined by recipient.'})
+        # --- Federated room join support ---
+        elif msg.get('type') == 'federated_room_join_request':
+            room_id = msg.get('room_id')
+            password = msg.get('password')
+            joiner_id = msg.get('joiner_id')
+            joiner_server = msg.get('joiner_server')
+            # Try to join the room (accept both full and short IDs)
+            if hasattr(self, 'room_manager'):
+                # Try to resolve short ID to full ID
+                full_room_id = self.room_manager.find_full_room_id(room_id)
+                if room_id in self.room_manager.rooms:
+                    full_room_id = room_id
+                if not full_room_id:
+                    # Check for ambiguity
+                    matches = [rid for rid in self.room_manager.rooms if rid.startswith(room_id)]
+                    if len(matches) > 1:
+                        response = {
+                            'type': 'federated_room_join_response',
+                            'room_id': room_id,
+                            'success': False,
+                            'error': 'Ambiguous room ID, please specify more characters'
+                        }
+                    else:
+                        response = {
+                            'type': 'federated_room_join_response',
+                            'room_id': room_id,
+                            'success': False,
+                            'error': 'Join failed or room not found'
+                        }
+                else:
+                    # Always use joiner_server as server_addr for userlist
+                    success = self.room_manager.join_room(full_room_id, joiner_id, password, server_addr=joiner_server)
+                    room = self.room_manager.get_room(full_room_id)
+                    if success and room:
+                        response = {
+                            'type': 'federated_room_join_response',
+                            'room': room.to_dict(),
+                            'success': True
+                        }
+                    else:
+                        response = {
+                            'type': 'federated_room_join_response',
+                            'room_id': room_id,
+                            'success': False,
+                            'error': 'Join failed or room not found'
+                        }
+                # Send response back to joiner's server
+                try:
+                    if joiner_server:
+                        host, port = joiner_server.split(':')
+                        port = int(port)
+                        self.federation.send_message(joiner_server, port, response, plaintext=True)
+                    else:
+                        # Fallback: send to peer_id
+                        host, port = peer_id.split(':')
+                        port = int(port)
+                        self.federation.send_message(peer_id, port, response, plaintext=True)
+                except Exception as e:
+                    print(f"[SERVER] Failed to send federated_room_join_response: {e}")
+            return
+        # --- Federated room join response: persist joined room ---
+        elif msg.get('type') == 'federated_room_join_response' and msg.get('success') and 'room' in msg:
+            room_data = msg['room']
+            room_id = room_data['room_id']
+            from room_protocol import Room
+            if room_id not in self.room_manager.rooms:
+                self.room_manager.rooms[room_id] = Room.from_dict(room_data)
+            if self.client_id not in self.room_manager.rooms[room_id].members:
+                self.room_manager.rooms[room_id].add_member(self.client_id)
+            self.room_manager.save_rooms()
+            # Relay the join response to the client UI
+            self.outbox.put({'type': 'federated_room_join_response', 'room': room_data, 'success': True})
+            # --- NEW: Broadcast userlist update to all servers ---
+            from room_server import broadcast_userlist_update
+            local_server_addr = f"{self.host}:{self.port}"
+            broadcast_userlist_update(self.room_manager, room_id, self.federation, local_server_addr)
+        elif msg.get('type') == 'federated_room_message':
+            room_id = msg.get('room_id')
+            message = msg.get('message')
+            # Add to room history and broadcast to local members
+            self.room_manager.add_message(room_id, message)
+            members = self.room_manager.get_members(room_id)
+            if members:
+                for member_id in members:
+                    self.outbox.put({'type': 'room_message', 'room_id': room_id, 'message': message})
+        elif msg.get('type') == 'federated_room_userlist_update':
+            room_id = msg.get('room_id')
+            userlist = set(msg.get('userlist', []))
+            old_userlist = self.room_manager.get_userlist(room_id)
+            # Merge incoming userlist with local userlist
+            self.room_manager.merge_userlist(room_id, userlist)
+            new_userlist = self.room_manager.get_userlist(room_id)
+            # If the userlist changed, broadcast to others
+            if old_userlist != new_userlist:
+                from room_server import broadcast_userlist_update
+                local_server_addr = f"{self.host}:{self.port}"
+                broadcast_userlist_update(self.room_manager, room_id, self.federation, local_server_addr)
+        elif msg.get('type') == 'federated_room_userlist_request':
+            from room_server import handle_userlist_request
+            msg['from_addr'] = peer_id
+            local_server_addr = f"{self.host}:{self.port}"
+            handle_userlist_request(self.room_manager, msg, self.federation, local_server_addr)
+        elif msg.get('type') == 'federated_room_userlist_response':
+            from room_server import handle_userlist_response
+            handle_userlist_response(self.room_manager, msg)
+        elif msg.get('type') == 'federated_room_history_request':
+            from room_server import handle_history_request
+            msg['from_addr'] = peer_id
+            local_server_addr = f"{self.host}:{self.port}"
+            handle_history_request(self.room_manager, msg, self.federation, local_server_addr)
+        elif msg.get('type') == 'federated_room_history_response':
+            from room_server import handle_history_response
+            handle_history_response(self.room_manager, msg)
         else:
             self.outbox.put(msg)
 
@@ -392,6 +513,20 @@ class ServerBackend:
                 print(f"[SERVER-DEBUG] Sent file_offer_response to {address}: file_id={file_id}, accepted={accepted}")
             else:
                 print(f"[SERVER-DEBUG] file_offer_response command has wrong number of parts: {len(parts)}")
+        elif command == 'remove_contact':
+            # No-op handler to avoid unknown command warning
+            self.outbox.put({'type': 'info', 'message': f'Contact removed: {args}'})
+        elif command == 'room_protocol':
+            # args is a dict from the client
+            if isinstance(args, dict):
+                def send_func(target_id, message_dict):
+                    # Send to the local client only (for now)
+                    self.outbox.put(message_dict)
+                # Pass federation and local_server_addr for federated room messaging
+                local_server_addr = f"{self.host}:{self.port}"
+                handle_room_message(self.room_manager, args, self.client_id, send_func, federation=self.federation, local_server_addr=local_server_addr)
+            else:
+                self.outbox.put({'type': 'info', 'message': f'room_protocol expects a dict, got: {type(args)}'})
         else:
             self.outbox.put({'type': 'info', 'message': f'Unknown command: {command} {args}'})
 
