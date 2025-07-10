@@ -6,6 +6,17 @@ import encryption_utils as enc
 from federation import Federation
 import media_utils
 import secrets
+import re
+import uuid
+
+def sanitize_filename(filename):
+    # Remove or replace characters not allowed on Windows
+    # Windows does not allow <>:"/\|?* and control chars
+    filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+    # Remove non-printable/control characters
+    filename = re.sub(r'[\x00-\x1f\x7f]', '', filename)
+    # Truncate to 200 chars to avoid path length issues
+    return filename[:200]
 
 class ServerBackend:
     def __init__(self, client_id, host='0.0.0.0', port=8443):
@@ -68,7 +79,7 @@ class ServerBackend:
             data = msg.get('data')
             if not os.path.exists('media'):
                 os.makedirs('media')
-            key_path = os.path.join('media', f'{file_id}.key')
+            key_path = os.path.join('media', sanitize_filename(f'{file_id}.key'))
             with open(key_path, 'wb') as f:
                 f.write(bytes.fromhex(data))
         elif msg.get('type') == 'file_metadata':
@@ -77,11 +88,11 @@ class ServerBackend:
                 os.makedirs('media')
             file_id = msg.get('file_id')
             meta = msg.get('metadata', {})
-            meta_path = os.path.join('media', f'{file_id}.meta.json')
+            meta_path = os.path.join('media', sanitize_filename(f'{file_id}.meta.json'))
             with open(meta_path, 'w') as f:
                 json.dump(meta, f)
             # Track received chunks
-            index_path = os.path.join('media', f'{file_id}.index.json')
+            index_path = os.path.join('media', sanitize_filename(f'{file_id}.index.json'))
             with open(index_path, 'w') as f:
                 json.dump({'received': [], 'expected_size': meta.get('size', 0)}, f)
             self.outbox.put({
@@ -97,11 +108,11 @@ class ServerBackend:
             chunk_idx = msg.get('chunk_idx', 0)
             if not os.path.exists('media'):
                 os.makedirs('media')
-            chunk_path = os.path.join('media', f'{file_id}.chunk{chunk_idx}')
+            chunk_path = os.path.join('media', sanitize_filename(f'{file_id}.chunk{chunk_idx}'))
             with open(chunk_path, 'wb') as f:
                 f.write(bytes.fromhex(chunk_data))
             # Update index
-            index_path = os.path.join('media', f'{file_id}.index.json')
+            index_path = os.path.join('media', sanitize_filename(f'{file_id}.index.json'))
             if os.path.exists(index_path):
                 with open(index_path, 'r') as f:
                     index = json.load(f)
@@ -112,7 +123,7 @@ class ServerBackend:
                 json.dump(index, f)
             
             # Send progress update to client
-            meta_path = os.path.join('media', f'{file_id}.meta.json')
+            meta_path = os.path.join('media', sanitize_filename(f'{file_id}.meta.json'))
             if os.path.exists(meta_path):
                 with open(meta_path, 'r') as f:
                     meta = json.load(f)
@@ -130,7 +141,7 @@ class ServerBackend:
                     })
             
             # Check if all chunks received (by size)
-            key_path = os.path.join('media', f'{file_id}.key')
+            key_path = os.path.join('media', sanitize_filename(f'{file_id}.key'))
             if os.path.exists(meta_path) and os.path.exists(key_path):
                 with open(meta_path, 'r') as f:
                     meta = json.load(f)
@@ -139,13 +150,13 @@ class ServerBackend:
                 total_size = 0
                 chunk_files = []
                 for idx in sorted(set(index['received'])):
-                    cpath = os.path.join('media', f'{file_id}.chunk{idx}')
+                    cpath = os.path.join('media', sanitize_filename(f'{file_id}.chunk{idx}'))
                     if os.path.exists(cpath):
                         total_size += os.path.getsize(cpath)
                         chunk_files.append(cpath)
                 if total_size >= expected_size and expected_size > 0:
                     # Reassemble
-                    enc_path = os.path.join('media', f'{file_id}.enc')
+                    enc_path = os.path.join('media', sanitize_filename(f'{file_id}.enc'))
                     with open(enc_path, 'wb') as outf:
                         for cpath in chunk_files:
                             with open(cpath, 'rb') as cf:
@@ -162,7 +173,10 @@ class ServerBackend:
                         print(f"[DEBUG] key len: {len(key)}, hex: {key.hex()[:32]}...")
                         print(f"[DEBUG] nonce len: {len(nonce)}, hex: {nonce.hex()[:32]}...")
                         orig_filename = meta.get('orig_filename', file_id)
-                        dec_path = os.path.join('media', f'{file_id}.decrypted_{orig_filename}')
+                        # Extract extension from original filename
+                        _, ext = os.path.splitext(orig_filename)
+                        random_hex = secrets.token_hex(16)
+                        dec_path = os.path.join('media', f'{random_hex}{ext}')
                         # Print first 16 bytes of .enc file
                         with open(enc_path, 'rb') as fenc:
                             enc_head = fenc.read(16)
@@ -216,7 +230,7 @@ class ServerBackend:
                     print(f"[SERVER-DEBUG] Starting file transfer: {filepath} to {address}")
                     if not os.path.exists('media'):
                         os.makedirs('media')
-                    enc_path = os.path.join('media', f'{file_id}.enc')
+                    enc_path = os.path.join('media', sanitize_filename(f'{file_id}.enc'))
                     key, nonce = media_utils.encrypt_file(filepath, enc_path)
                     # Encrypt AES key+nonce with recipient's RSA public key
                     peer_key = self.federation.known_servers.get(address)

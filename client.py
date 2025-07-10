@@ -5,7 +5,7 @@ import threading
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QListWidget, QTextEdit, QLineEdit, QPushButton, QVBoxLayout, QHBoxLayout, QListWidgetItem, QMessageBox, QInputDialog, QMenu, QFileDialog, QTextBrowser
 )
-from PyQt6.QtCore import Qt, QTimer, QRect, QCoreApplication
+from PyQt6.QtCore import Qt, QTimer, QRect, QCoreApplication, QUrl
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
@@ -14,6 +14,8 @@ import base64
 import getpass
 import os
 import secrets
+import mimetypes
+from PyQt6.QtGui import QDesktopServices
 
 class PyQtFederatedClient(QWidget):
     def __init__(self, backend, client_id=None):
@@ -160,11 +162,20 @@ class PyQtFederatedClient(QWidget):
         main_layout.addLayout(left_panel, 2)
         # Chat area
         chat_layout = QVBoxLayout()
+        # Chat display
         self.chat_display = QTextBrowser()
-        self.chat_display.setReadOnly(True)
-        # Enable clickable links and buttons
-        self.chat_display.setOpenExternalLinks(False)
-        self.chat_display.anchorClicked.connect(self.handle_chat_link)
+        self.chat_display.setOpenExternalLinks(False)  # Prevent default link handling
+        self.chat_display.anchorClicked.connect(self.handle_chat_link)  # Use our custom handler
+        self.chat_display.setStyleSheet("""
+            QTextBrowser {
+                border: 1px solid #dee2e6;
+                border-radius: 5px;
+                padding: 10px;
+                font-family: 'Segoe UI', Arial, sans-serif;
+                font-size: 12px;
+                line-height: 1.4;
+            }
+        """)
         chat_layout.addWidget(self.chat_display, 8)
         # Message entry
         entry_layout = QHBoxLayout()
@@ -312,16 +323,57 @@ class PyQtFederatedClient(QWidget):
                 # Progress dialog is already shown when accepting the file offer
                 # No need to add chat messages anymore
             elif msg_type == 'file_complete':
-                address = msg.get('from_server') or msg.get('from_client') or msg.get('address')
                 file_id = msg.get('file_id')
                 decrypted_path = msg.get('decrypted_path')
                 orig_filename = msg.get('orig_filename')
-                print(f"[CLIENT-DEBUG] file_complete: address={address}, file_id={file_id}, dec_path={decrypted_path}")
+                metadata = msg.get('metadata', {})
+                print(f"[CLIENT-DEBUG] file_complete: file_id={file_id}, dec_path={decrypted_path}")
+                
+                # Find the address by looking up the file_id in existing chat history
+                address = None
+                for addr, messages in self.active_chats.items():
+                    for msg_tuple in messages:
+                        if (isinstance(msg_tuple, tuple) and len(msg_tuple) > 2 and 
+                            isinstance(msg_tuple[2], dict) and 
+                            msg_tuple[2].get('file_id') == file_id):
+                            address = addr
+                            break
+                    if address:
+                        break
+                
+                if not address:
+                    print(f"[CLIENT-DEBUG] Warning: Could not find address for file_id {file_id}")
+                    # Try to use current_server as fallback
+                    address = self.current_server
+                    if not address:
+                        print(f"[CLIENT-DEBUG] No current_server either, cannot process file_complete")
+                        return
+                
+                print(f"[CLIENT-DEBUG] Found address for file {file_id}: {address}")
                 
                 # Close progress dialog and show completion popup
                 self.close_file_progress_dialog(file_id)
                 
-                # No need to add chat messages anymore since we show popup
+                # Add the completed file to chat history so it can be displayed inline
+                if address and decrypted_path and os.path.exists(decrypted_path):
+                    if address not in self.active_chats:
+                        self.active_chats[address] = self.load_chat_history(address)
+                    
+                    # Add the file to chat history with 'ready' status
+                    self.active_chats[address].append((address, f'[File: {orig_filename}]', {
+                        'file_id': file_id,
+                        'path': decrypted_path,
+                        'meta': metadata,
+                        'status': 'ready'
+                    }))
+                    self.save_chat_history(address)
+                    
+                    # Update the chat display if this is the current conversation
+                    if self.current_server == address:
+                        self.display_chat(address)
+                
+                # Show completion popup
+                QMessageBox.information(self, "Download Complete", "File download has completed successfully!")
             elif msg_type == 'file_offer':
                 address = msg.get('from_server') or msg.get('from_client') or msg.get('address')
                 file_id = msg.get('file_id')
@@ -345,7 +397,19 @@ class PyQtFederatedClient(QWidget):
                     # Accept the file transfer
                     print(f"[CLIENT-DEBUG] Accepting file transfer: {file_id}")
                     self.backend.send_command('file_offer_response', f'{address} {file_id} accept')
-                    
+
+                    # Add a placeholder to chat history for this file transfer
+                    if address not in self.active_chats:
+                        self.active_chats[address] = self.load_chat_history(address)
+                    self.active_chats[address].append((address, f'[File: {filename}] (Receiving...)', {
+                        'file_id': file_id,
+                        'meta': {'orig_filename': filename},
+                        'status': 'receiving'
+                    }))
+                    self.save_chat_history(address)
+                    if self.current_server == address:
+                        self.display_chat(address)
+
                     # Show progress dialog for download (non-modal)
                     self.show_file_progress_dialog(address, file_id, filename, size)
                 else:
@@ -378,6 +442,11 @@ class PyQtFederatedClient(QWidget):
                     print(f"[CLIENT-DEBUG] No file_progress_dialogs attribute found")
                 
                 # Progress is handled by the progress dialog, no need for chat messages
+            elif msg_type == 'file_error':
+                file_id = msg.get('file_id')
+                error = msg.get('error', 'Unknown error')
+                print(f"[CLIENT-DEBUG] file_error: file_id={file_id}, error={error}")
+                QMessageBox.critical(self, "File Transfer Error", f"File transfer failed for file ID:\n{file_id}\n\nError: {error}")
             else:
                 print(f"[CLIENT-DEBUG] Unhandled message type: {msg_type}")
         except Exception as e:
@@ -424,14 +493,33 @@ class PyQtFederatedClient(QWidget):
 
     def display_chat(self, address):
         self.chat_display.clear()
+        self.file_entry_map = {}  # Map both full display text and filename to file path
         messages = self.active_chats.get(address, [])
         for msg in messages:
             if isinstance(msg, tuple) and len(msg) > 2 and isinstance(msg[2], dict) and msg[2].get('status') == 'ready':
                 # File ready to open
                 file_info = msg[2]
-                orig_filename = file_info.get('meta', {}).get('orig_filename', file_info.get('file_id'))
                 path = file_info.get('path')
-                self.chat_display.append(f'<a href="file://{path}"><b>{msg[0]}:</b> [File: {orig_filename}] (Click to open)</a>')
+                saved_filename = os.path.basename(path) if path else '(unknown)'
+                file_exists = os.path.exists(path) if path else False
+                sender = msg[0]
+                if sender == self.client_id:
+                    display_name = "You"
+                elif sender in self.contacts.values():
+                    display_name = sender
+                elif sender in self.contacts:
+                    display_name = self.contacts.get(sender, sender)
+                else:
+                    display_name = sender
+                
+                # Compose display text for the file entry
+                plain_display = f'{display_name}: 📎 {saved_filename}'
+                file_display = f'<span style="color: #007bff; text-decoration: underline; cursor: pointer;"><b>{display_name}:</b> 📎 {saved_filename}</span>' if file_exists else f'<span style="color: #6c757d; text-decoration: line-through;"><b>{display_name}:</b> 📎 {saved_filename} (file not found)</span>'
+                self.chat_display.append(file_display)
+                if file_exists:
+                    # Store mapping from both full display text and filename to file path
+                    self.file_entry_map[plain_display] = os.path.abspath(path)
+                    self.file_entry_map[saved_filename] = os.path.abspath(path)
             else:
                 sender, message = msg[:2]
                 if sender == 'System':
@@ -439,7 +527,6 @@ class PyQtFederatedClient(QWidget):
                         print(f"[CLIENT-DEBUG] Appending System message to chat: {message}")
                         self.chat_display.append(message)
                     else:
-                        # Skip or stringify non-string system messages to avoid crash
                         self.chat_display.append(str(message))
                 else:
                     if sender == self.client_id:
@@ -451,6 +538,9 @@ class PyQtFederatedClient(QWidget):
                     else:
                         display_name = sender
                     self.chat_display.append(f"<b>{display_name}:</b> {message}")
+
+        # Install event filter for click-to-open
+        self.chat_display.viewport().installEventFilter(self)
 
     def on_send_message(self):
         message = self.message_entry.text().strip()
@@ -652,43 +742,87 @@ class PyQtFederatedClient(QWidget):
         progress.setValue(0)
         
     def close_file_progress_dialog(self, file_id):
-        """Close the progress dialog for a specific file and show completion popup"""
+        """Close the progress dialog for a specific file"""
         if hasattr(self, 'file_progress_dialogs') and file_id in self.file_progress_dialogs:
             progress = self.file_progress_dialogs[file_id]
             progress.setValue(100)
             progress.close()
             del self.file_progress_dialogs[file_id]
-            
-            # Show completion popup
-            QMessageBox.information(self, "Download Complete", "File download has completed successfully!")
 
     def handle_chat_link(self, url):
-        url_str = url.toString()
-        print(f"[CLIENT-DEBUG] handle_chat_link called with URL: {url_str}")
-        
-        # Handle file:// links for opening files
-        if url_str.startswith('file://'):
-            import subprocess
-            import platform
-            file_path = url_str[7:]  # Remove 'file://' prefix
-            
-            try:
-                if platform.system() == 'Windows':
-                    os.startfile(file_path)
-                elif platform.system() == 'Darwin':  # macOS
-                    subprocess.run(['open', file_path])
-                else:  # Linux
-                    subprocess.run(['xdg-open', file_path])
-                print(f"[CLIENT-DEBUG] Opened file: {file_path}")
-            except Exception as e:
-                print(f"[CLIENT-DEBUG] Failed to open file {file_path}: {e}")
+        """Handle clicks on links in the chat display and prevent navigation/blanking."""
+        url_string = url.toString()
+        print(f"[CLIENT-DEBUG] Link clicked: {url_string}")
+        self.chat_display.setSource(QUrl())
+        file_path = url.toLocalFile()
+        if file_path:
+            abs_file_path = os.path.abspath(os.path.normpath(file_path))
+            print(f"[CLIENT-DEBUG] Absolute file path: {abs_file_path}")
+            if os.path.exists(abs_file_path):
+                print(f"[CLIENT-DEBUG] Opening file: {abs_file_path}")
+                try:
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(abs_file_path))
+                except Exception as e:
+                    print(f"[CLIENT-DEBUG] Failed to open file: {e}")
+                    QMessageBox.warning(self, "File Error", f"Could not open file: {os.path.basename(abs_file_path)}")
+            else:
+                print(f"[CLIENT-DEBUG] File not found: {abs_file_path}")
+                QMessageBox.warning(self, "File Not Found", f"File not found: {os.path.basename(abs_file_path)}")
         else:
-            print(f"[CLIENT-DEBUG] Unhandled URL type: {url_str}")
+            print(f"[CLIENT-DEBUG] No file path found in link!")
 
     def eventFilter(self, obj, event):
         from PyQt6.QtCore import QEvent
-        # No longer needed for Accept/Decline, handled by anchorClicked
+        if obj == self.chat_display.viewport() and event.type() == QEvent.Type.MouseButtonRelease:
+            print(f"[CLIENT-DEBUG] eventFilter: Mouse event {event.type()} at {event.position().toPoint()}")
+            cursor = self.chat_display.cursorForPosition(event.position().toPoint())
+            cursor.select(cursor.SelectionType.LineUnderCursor)
+            selected_text = cursor.selectedText().strip()
+            print(f"[CLIENT-DEBUG] eventFilter: Selected text: '{selected_text}'")
+            # Try to match the selected text to a file entry by full display text or filename
+            if selected_text in self.file_entry_map:
+                file_path = self.file_entry_map[selected_text]
+                print(f"[CLIENT-DEBUG] Clicked file entry: {file_path}")
+                if os.path.exists(file_path):
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(file_path))
+                else:
+                    QMessageBox.warning(self, "File Not Found", f"File not found: {os.path.basename(file_path)}")
+                return True
         return super().eventFilter(obj, event)
+
+    def is_media_file(self, filepath):
+        """Check if a file is an image or video"""
+        if not filepath or not os.path.exists(filepath):
+            return False
+        
+        mime_type, _ = mimetypes.guess_type(filepath)
+        if mime_type:
+            return mime_type.startswith(('image/', 'video/'))
+        return False
+    
+    def get_media_display_html(self, filepath, filename, max_width=300, max_height=200):
+        """Generate HTML for displaying media files inline"""
+        if not self.is_media_file(filepath):
+            return None
+        
+        mime_type, _ = mimetypes.guess_type(filepath)
+        if not mime_type:
+            return None
+        
+        # Convert file path to file:// URL for HTML display
+        file_url = QUrl.fromLocalFile(filepath).toString()
+        
+        if mime_type.startswith('image/'):
+            # Display image inline
+            return f'<div style="margin: 5px 0;"><img src="{file_url}" style="max-width: {max_width}px; max-height: {max_height}px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);" alt="{filename}"><br><small style="color: inherit; opacity: 0.7;">{filename}</small></div>'
+        
+        elif mime_type.startswith('video/'):
+            # Display video with thumbnail and play button
+            # For now, show a video placeholder with filename
+            # In a more advanced implementation, we could generate thumbnails
+            return f'<div style="margin: 5px 0; padding: 10px; background: rgba(0,0,0,0.05); border-radius: 8px; border: 1px solid rgba(0,0,0,0.1);"><a href="file://{filepath}" style="text-decoration: none; color: #007bff;">🎬 {filename}</a><br><small style="color: inherit; opacity: 0.7;">Click to play video</small></div>'
+        
+        return None
 
 # Usage example (replace backend with your actual backend object):
 # if __name__ == "__main__":
